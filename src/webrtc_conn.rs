@@ -102,42 +102,31 @@ pub async fn run_host(
     auth_type: AuthType,
     mut screen_capturer: ScreenCapturer,
     input_injector: InputInjector,
-    relay: Option<crate::signaling::Relay>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting host WebRTC server");
 
-    if let Some(relay) = &relay {
-        println!("\n=== HOST MODE ACTIVE (RELAY) ===");
-        println!("Connection token: {}", relay.token);
-        println!("\nOn the viewer machine, run:");
-        println!("  p2p-remote --connect --relay <relay-url> --token {}", relay.token);
-        println!("\nThe token is the only secret the viewer needs; it is good for this");
-        println!("session only. The offer and answer are exchanged through the relay.");
-        println!("\n================================\n");
-    } else {
-        match &auth_type {
-            AuthType::Pairing(code) => {
-                println!("\n=== HOST MODE ACTIVE ===");
-                println!("Pairing Code: {}", code);
-                println!("\nTo connect:");
-                println!("1. On viewer machine, run: p2p-remote --connect {}", code);
-                println!("2. Copy the SDP offer shown below");
-                println!("3. Paste it into the viewer");
-                println!("4. Copy the SDP answer from viewer");
-                println!("5. Paste it here to establish connection");
-                println!("\n=========================\n");
-            }
-            AuthType::Cert => {
-                println!("\n=== HOST MODE ACTIVE (CERTIFICATE AUTH) ===");
-                println!("Waiting for certificate-based connection...");
-                println!("\nTo connect:");
-                println!("1. On viewer machine, run: p2p-remote --connect cert --auth cert");
-                println!("2. Copy the SDP offer shown below");
-                println!("3. Paste it into the viewer");
-                println!("4. Copy the SDP answer from viewer");
-                println!("5. Paste it here to establish connection");
-                println!("\n==========================================\n");
-            }
+    match &auth_type {
+        AuthType::Pairing(code) => {
+            println!("\n=== HOST MODE ACTIVE ===");
+            println!("Pairing Code: {}", code);
+            println!("\nTo connect:");
+            println!("1. On viewer machine, run: p2p-remote --connect {}", code);
+            println!("2. Copy the SDP offer shown below");
+            println!("3. Paste it into the viewer");
+            println!("4. Copy the SDP answer from viewer");
+            println!("5. Paste it here to establish connection");
+            println!("\n=========================\n");
+        }
+        AuthType::Cert => {
+            println!("\n=== HOST MODE ACTIVE (CERTIFICATE AUTH) ===");
+            println!("Waiting for certificate-based connection...");
+            println!("\nTo connect:");
+            println!("1. On viewer machine, run: p2p-remote --connect cert --auth cert");
+            println!("2. Copy the SDP offer shown below");
+            println!("3. Paste it into the viewer");
+            println!("4. Copy the SDP answer from viewer");
+            println!("5. Paste it here to establish connection");
+            println!("\n==========================================\n");
         }
     }
 
@@ -225,25 +214,18 @@ pub async fn run_host(
     let mut sdp_offer = local_desc.sdp.clone();
     sdp_offer.push_str(&format!("a=handshake:{}\r\n", handshake_b64));
 
-    // Exchange the offer/answer: through the relay if configured, otherwise the
-    // manual copy-paste path.
-    let sdp_answer = if let Some(relay) = &relay {
-        relay.put_offer(&sdp_offer).await?;
-        println!("Offer published to relay. Waiting for the viewer to connect...");
-        relay.poll_answer(std::time::Duration::from_secs(120)).await?
-    } else {
-        println!("=== SDP OFFER (copy this) ===");
-        println!("{}", sdp_offer);
-        println!("============================\n");
+    println!("=== SDP OFFER (copy this) ===");
+    println!("{}", sdp_offer);
+    println!("============================\n");
 
-        println!("Enter SDP answer from viewer (press Enter twice when done):");
-        let answer = read_multiline_input()?;
-        if answer.is_empty() {
-            error!("No SDP answer provided");
-            return Err("Connection cancelled".into());
-        }
-        answer
-    };
+    // Wait for SDP answer from user
+    println!("Enter SDP answer from viewer (press Enter twice when done):");
+    let sdp_answer = read_multiline_input()?;
+
+    if sdp_answer.is_empty() {
+        error!("No SDP answer provided");
+        return Err("Connection cancelled".into());
+    }
 
     debug!("Received SDP answer, attempting to connect...");
 
@@ -297,6 +279,142 @@ pub async fn run_host(
     // Cleanup
     pc.close().await?;
 
+    Ok(())
+}
+
+/// Unattended host over a signalling relay.
+///
+/// Provisioned once with a stable `token` (the pairing secret + rendezvous key),
+/// then left running. It waits for a viewer to open a request, negotiates one
+/// session, and on disconnect loops back to wait for the next — no human at the
+/// host, ever.
+pub async fn run_host_relay(
+    token: String,
+    mut screen_capturer: ScreenCapturer,
+    input_injector: InputInjector,
+    relay: crate::signaling::Relay,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("\n=== HOST MODE ACTIVE (RELAY, UNATTENDED) ===");
+    println!("Waiting for connection requests via the relay.");
+    println!("Connect from the viewer with the shared token. Press Ctrl+C to stop.");
+    println!("\n===========================================\n");
+
+    let injector = Arc::new(input_injector);
+
+    loop {
+        // Block until a viewer opens a request (tolerant of relay hiccups).
+        relay.wait_for_request().await?;
+        info!("Connection request received; negotiating session");
+
+        match host_serve_one(&relay, &token, &mut screen_capturer, injector.clone()).await {
+            Ok(()) => info!("Session ended; waiting for the next request"),
+            Err(e) => warn!("Session ended with error: {}; waiting for the next request", e),
+        }
+    }
+}
+
+/// Negotiate and serve exactly one viewer session (one WebRTC peer connection).
+async fn host_serve_one(
+    relay: &crate::signaling::Relay,
+    token: &str,
+    screen_capturer: &mut ScreenCapturer,
+    injector: Arc<InputInjector>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pc = create_peer_connection().await?;
+    let data_channel = pc.create_data_channel("input", None).await?;
+    let data_channel_clone = data_channel.clone();
+
+    let dc_connected = Arc::new(RwLock::new(false));
+    let dc_connected_clone = dc_connected.clone();
+    data_channel.on_open(Box::new(move || {
+        let connected = dc_connected_clone.clone();
+        Box::pin(async move {
+            info!("Data channel open");
+            *connected.write().await = true;
+        })
+    }));
+
+    let injector_clone = injector.clone();
+    data_channel.on_message(Box::new(move |msg: DataChannelMessage| {
+        let injector = injector_clone.clone();
+        Box::pin(async move {
+            if let Ok(text) = String::from_utf8(msg.data.to_vec()) {
+                if let Ok(input) = serde_json::from_str::<RemoteInput>(&text) {
+                    convert_and_inject(&injector, &input).await;
+                }
+            }
+        })
+    }));
+
+    // Signalled when the peer leaves, so one session's capture loop ends and the
+    // host returns to waiting for the next request.
+    let disconnected = Arc::new(tokio::sync::Notify::new());
+    let disconnected_clone = disconnected.clone();
+    pc.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
+        let disconnected = disconnected_clone.clone();
+        Box::pin(async move {
+            info!("Peer connection state change: {:?}", state);
+            if matches!(
+                state,
+                RTCPeerConnectionState::Disconnected
+                    | RTCPeerConnectionState::Failed
+                    | RTCPeerConnectionState::Closed
+            ) {
+                disconnected.notify_one();
+            }
+        })
+    }));
+
+    // Build the offer, waiting for ICE gathering so candidates are embedded, and
+    // bind the handshake to this session's DTLS fingerprint (secret = the token).
+    let offer = pc.create_offer(None).await?;
+    let mut gather_complete = pc.gathering_complete_promise().await;
+    pc.set_local_description(offer).await?;
+    let _ = gather_complete.recv().await;
+
+    let local_desc = pc
+        .local_description()
+        .await
+        .ok_or("failed to get local description after ICE gathering")?;
+    let fingerprint = extract_fingerprint_from_sdp(&local_desc.sdp)
+        .ok_or("no DTLS fingerprint in local offer")?;
+    let handshake = HandshakeData::new(token, &fingerprint);
+
+    let mut sdp_offer = local_desc.sdp.clone();
+    sdp_offer.push_str(&format!(
+        "a=handshake:{}\r\n",
+        base64::encode(serde_json::to_string(&handshake)?)
+    ));
+
+    relay.put_offer(&sdp_offer).await?;
+    let sdp_answer = relay.poll_answer(Duration::from_secs(120)).await?;
+
+    let answer = webrtc::peer_connection::sdp::session_description::RTCSessionDescription::answer(sdp_answer)?;
+    pc.set_remote_description(answer).await?;
+
+    // Wait for the data channel to open.
+    let timeout = Duration::from_secs(60);
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if *dc_connected.read().await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    if *dc_connected.read().await {
+        info!("Viewer connected; screen sharing started");
+        println!("Viewer connected. Screen sharing...\n");
+        // Capture until the viewer disconnects, then fall through to serve the next.
+        tokio::select! {
+            r = start_capture_loop(screen_capturer, injector, data_channel_clone) => { r?; }
+            _ = disconnected.notified() => { info!("Viewer disconnected"); }
+        }
+    } else {
+        warn!("Connection timed out before the data channel opened");
+    }
+
+    pc.close().await?;
     Ok(())
 }
 

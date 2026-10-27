@@ -46,21 +46,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match args[1].as_str() {
         "--host" => {
             // Host mode: wait for connections
-            host_mode(auth_type, relay_url).await?;
+            host_mode(auth_type, relay_url, parse_relay_auth(&args), host_token(&args)).await?;
         }
         "--connect" => {
             if let Some(url) = relay_url {
-                // Relay mode: the host's one-time token is both the rendezvous key
-                // and the pairing secret. Take it from --token, or prompt for it.
-                let token = match parse_token(&args) {
+                // Relay mode: the host's stable pre-shared token is both the
+                // rendezvous key and the pairing secret. Take it from --token
+                // (or P2P_RELAY_TOKEN), else prompt for it.
+                let token = match parse_token(&args).or_else(|| std::env::var("P2P_RELAY_TOKEN").ok()) {
                     Some(t) => t,
-                    None => prompt_line("Enter the connection token from the host: ")?,
+                    None => prompt_line("Enter the connection token for the host: ")?,
                 };
                 if token.is_empty() {
                     eprintln!("A connection token is required in relay mode.");
                     return Ok(());
                 }
-                client_mode_relay(url, token).await?;
+                client_mode_relay(url, token, parse_relay_auth(&args)).await?;
             } else {
                 // Client mode: connect to a host via manual SDP copy-paste
                 let auth_value = if args.len() > 2 { &args[2] } else { "" };
@@ -128,11 +129,12 @@ Usage:
   {} --list-certs        List available certificates
   {} --show-cert         Show current certificate info
 
-Signalling relay (optional — removes manual SDP copy-paste):
-  --relay <url>          Exchange SDP via a relay instead of copy-paste.
-                         Host prints a one-time token; run the viewer with
-                         --relay <url> and enter (or pass --token) that token.
-  --token <token>        Viewer: the host's one-time token (else prompted)
+Signalling relay (optional — unattended, no manual SDP copy-paste):
+  --relay <url>          Exchange SDP via the relay instead of copy-paste.
+  --token <token>        Stable shared token. Host: provision once (or set
+                         P2P_RELAY_TOKEN) and leave running; viewer: the same
+                         token to connect. Keys the rendezvous and the pairing.
+  --relay-auth u:p       Authentik Basic Auth for the relay (or P2P_RELAY_AUTH)
 
 Authentication:
   --auth <type>          Auth type: "pairing" (default) or "cert"
@@ -186,6 +188,8 @@ fn validate_auth_arg(arg: &str) -> bool {
 async fn host_mode(
     auth_type: webrtc_conn::AuthType,
     relay_url: Option<String>,
+    relay_auth: Option<(String, String)>,
+    token: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Running in HOST mode - waiting for connection");
 
@@ -197,24 +201,34 @@ async fn host_mode(
     let input_injector = input_injector::InputInjector::new();
     info!("Input injector ready");
 
-    // In relay mode the host mints a one-time token; it doubles as the pairing
-    // secret, so the auth type is overridden to use it.
-    let relay = relay_url.map(|url| signaling::Relay::new(&url, signaling::generate_token()));
-    let auth_type = match &relay {
-        Some(r) => webrtc_conn::AuthType::Pairing(r.token.clone()),
-        None => auth_type,
-    };
-
-    // Start WebRTC host
-    webrtc_conn::run_host(auth_type, screen_capturer, input_injector, relay).await?;
+    if let Some(url) = relay_url {
+        // Unattended relay mode: a stable, pre-provisioned token is required (set
+        // once at install), since nobody is at the host to read a generated one.
+        let token = match token {
+            Some(t) if !t.is_empty() => t,
+            _ => {
+                eprintln!("Relay host mode needs a stable token: pass --token <token> or set P2P_RELAY_TOKEN.");
+                return Ok(());
+            }
+        };
+        let relay = signaling::Relay::new(&url, token.clone(), relay_auth);
+        webrtc_conn::run_host_relay(token, screen_capturer, input_injector, relay).await?;
+    } else {
+        webrtc_conn::run_host(auth_type, screen_capturer, input_injector).await?;
+    }
 
     Ok(())
 }
 
-/// Viewer side of relay mode: fetch the host's offer from the relay, answer it.
-async fn client_mode_relay(url: String, token: String) -> Result<(), Box<dyn std::error::Error>> {
+/// Viewer side of relay mode: open a request, fetch the host's offer, answer it.
+async fn client_mode_relay(
+    url: String,
+    token: String,
+    relay_auth: Option<(String, String)>,
+) -> Result<(), Box<dyn std::error::Error>> {
     info!("Connecting via relay...");
-    let relay = signaling::Relay::new(&url, token);
+    let relay = signaling::Relay::new(&url, token, relay_auth);
+    relay.open_request().await?;
     let offer = relay.poll_offer(std::time::Duration::from_secs(120)).await?;
     info!("Received offer via relay, generating answer...");
     let auth = webrtc_conn::AuthType::Pairing(relay.token.clone());
@@ -228,6 +242,23 @@ fn parse_relay(args: &[String]) -> Option<String> {
 
 fn parse_token(args: &[String]) -> Option<String> {
     args.iter().position(|a| a == "--token").and_then(|i| args.get(i + 1)).map(|s| s.to_string())
+}
+
+/// Host's stable relay token: --token, or the P2P_RELAY_TOKEN env var.
+fn host_token(args: &[String]) -> Option<String> {
+    parse_token(args).or_else(|| std::env::var("P2P_RELAY_TOKEN").ok())
+}
+
+/// Authentik Basic Auth for the relay: `--relay-auth user:pass`, or P2P_RELAY_AUTH.
+/// The env var is preferred so the password is not visible in the process list.
+fn parse_relay_auth(args: &[String]) -> Option<(String, String)> {
+    let raw = args
+        .iter()
+        .position(|a| a == "--relay-auth")
+        .and_then(|i| args.get(i + 1))
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("P2P_RELAY_AUTH").ok());
+    raw.and_then(|s| s.split_once(':').map(|(u, p)| (u.to_string(), p.to_string())))
 }
 
 fn prompt_line(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {

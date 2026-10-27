@@ -52,16 +52,21 @@ pub struct Relay {
     /// The shared one-time token. Also the pairing secret — never sent to the relay.
     pub token: String,
     rendezvous_id: String,
+    /// Optional HTTP Basic Auth credential. The relay sits behind Authentik
+    /// forward-auth (no ingress exemption), so a headless client presents this to
+    /// get through the proxy. `(username, password)`.
+    auth: Option<(String, String)>,
     client: reqwest::Client,
 }
 
 impl Relay {
-    pub fn new(base_url: &str, token: String) -> Self {
+    pub fn new(base_url: &str, token: String, auth: Option<(String, String)>) -> Self {
         let rendezvous_id = rendezvous_id(&token);
         Relay {
             base_url: base_url.trim_end_matches('/').to_string(),
             token,
             rendezvous_id,
+            auth,
             client: reqwest::Client::new(),
         }
     }
@@ -70,11 +75,17 @@ impl Relay {
         format!("{}/api/signal/rendezvous/{}/{}", self.base_url, self.rendezvous_id, kind)
     }
 
+    /// Attach the Authentik Basic Auth credential if one was supplied.
+    fn with_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.auth {
+            Some((user, pass)) => req.basic_auth(user, Some(pass)),
+            None => req,
+        }
+    }
+
     async fn put_sdp(&self, kind: &str, sdp: &str) -> Result<(), BoxErr> {
         let resp = self
-            .client
-            .put(self.url(kind))
-            .json(&serde_json::json!({ "sdp": sdp }))
+            .with_auth(self.client.put(self.url(kind)).json(&serde_json::json!({ "sdp": sdp })))
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -86,7 +97,7 @@ impl Relay {
 
     /// GET an SDP blob; `None` when the relay has none yet (404).
     async fn get_sdp(&self, kind: &str, field: &str) -> Result<Option<String>, BoxErr> {
-        let resp = self.client.get(self.url(kind)).send().await?;
+        let resp = self.with_auth(self.client.get(self.url(kind))).send().await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -102,6 +113,36 @@ impl Relay {
     }
     pub async fn put_answer(&self, sdp: &str) -> Result<(), BoxErr> {
         self.put_sdp("answer", sdp).await
+    }
+
+    /// Viewer: open a connection request, waking the polling host.
+    pub async fn open_request(&self) -> Result<(), BoxErr> {
+        let resp = self.with_auth(self.client.post(self.url("request"))).send().await?;
+        if !resp.status().is_success() {
+            return Err(format!("relay rejected connection request ({})", resp.status()).into());
+        }
+        info!("Connection request opened; waiting for the host to respond...");
+        Ok(())
+    }
+
+    /// Host: wait (indefinitely) for a viewer to open a request. Tolerant of relay
+    /// hiccups — it logs and keeps polling rather than giving up, so an unattended
+    /// host stays available.
+    pub async fn wait_for_request(&self) -> Result<(), BoxErr> {
+        loop {
+            match self.with_auth(self.client.get(self.url("request"))).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Ok(body) = resp.json::<serde_json::Value>().await {
+                        if body.get("state").and_then(|v| v.as_str()) == Some("requested") {
+                            return Ok(());
+                        }
+                    }
+                }
+                Ok(_) => {} // 404 = no active rendezvous yet; keep waiting
+                Err(e) => debug!("relay poll error (will retry): {}", e),
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
     }
 
     /// Poll for the viewer's answer (host side) until it arrives or we time out.
