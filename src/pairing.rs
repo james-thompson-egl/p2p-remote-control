@@ -56,8 +56,18 @@ pub fn derive_shared_secret(pairing_code: &str, salt: &[u8]) -> [u8; 32] {
     secret
 }
 
-/// Generate an authentication token for the handshake
-pub fn generate_auth_token(pairing_code: &str, salt: &[u8], nonce: &[u8]) -> String {
+/// Generate an authentication token for the handshake.
+///
+/// The token binds the peer's DTLS fingerprint: it is fed into the HMAC
+/// alongside the nonce, so a party that does not know the pairing code (e.g. a
+/// signaling relay) cannot substitute a different fingerprint — doing so would
+/// require re-computing the HMAC, which needs the derived secret.
+pub fn generate_auth_token(
+    pairing_code: &str,
+    salt: &[u8],
+    nonce: &[u8],
+    dtls_fingerprint: &str,
+) -> String {
     let secret = derive_shared_secret(pairing_code, salt);
 
     let mut mac = HmacSha256::new_from_slice(&secret)
@@ -65,6 +75,8 @@ pub fn generate_auth_token(pairing_code: &str, salt: &[u8], nonce: &[u8]) -> Str
 
     mac.update(nonce);
     mac.update(b"p2p-remote-handshake");
+    mac.update(b"|dtls-fingerprint|");
+    mac.update(dtls_fingerprint.as_bytes());
 
     let result = mac.finalize();
     let token = STANDARD.encode(result.into_bytes().as_slice());
@@ -78,9 +90,10 @@ pub fn verify_auth_token(
     pairing_code: &str,
     salt: &[u8],
     nonce: &[u8],
+    dtls_fingerprint: &str,
     token: &str,
 ) -> bool {
-    let expected = generate_auth_token(pairing_code, salt, nonce);
+    let expected = generate_auth_token(pairing_code, salt, nonce, dtls_fingerprint);
     // Constant-time comparison to prevent timing attacks
     use std::time::Instant;
     let start = Instant::now();
@@ -159,7 +172,6 @@ Pairing Code: {}
 /// Pairing handshake data structure
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HandshakeData {
-    pub pairing_code_hash: String,
     pub salt: String,
     pub nonce: String,
     pub auth_token: String,
@@ -167,21 +179,41 @@ pub struct HandshakeData {
 }
 
 impl HandshakeData {
-    pub fn new(pairing_code: &str) -> Self {
+    /// Build a handshake that authenticates the pairing code and commits to this
+    /// peer's DTLS fingerprint. The fingerprint is both stored and folded into
+    /// the HMAC, so it cannot be swapped in transit without the pairing code.
+    ///
+    /// Note: the derived secret is deliberately NOT included in the handshake —
+    /// transmitting it would hand the HMAC key to anyone who sees the SDP.
+    pub fn new(pairing_code: &str, dtls_fingerprint: &str) -> Self {
         let salt = generate_salt();
         let nonce = generate_nonce();
-        let auth_token = generate_auth_token(pairing_code, &salt, &nonce);
+        let auth_token = generate_auth_token(pairing_code, &salt, &nonce, dtls_fingerprint);
 
         HandshakeData {
-            pairing_code_hash: STANDARD.encode(derive_shared_secret(pairing_code, &salt)),
             salt: encode_salt(&salt),
             nonce: STANDARD.encode(&nonce),
             auth_token,
-            dtls_fingerprint: None,
+            dtls_fingerprint: Some(dtls_fingerprint.to_string()),
         }
     }
 
-    pub fn verify(&self, pairing_code: &str) -> bool {
+    /// Verify the handshake against the pairing code and the DTLS fingerprint
+    /// actually present in the received SDP.
+    ///
+    /// Both must hold: the HMAC proves the sender knew the pairing code, and the
+    /// fingerprint equality proves the SDP carries the exact fingerprint that was
+    /// signed — so a relay that rewrote the `a=fingerprint` line (to mount a
+    /// man-in-the-middle) is rejected.
+    pub fn verify(&self, pairing_code: &str, sdp_fingerprint: &str) -> bool {
+        let bound_fingerprint = match &self.dtls_fingerprint {
+            Some(fp) => fp,
+            None => return false,
+        };
+        if bound_fingerprint != sdp_fingerprint {
+            return false;
+        }
+
         let salt = match decode_salt(&self.salt) {
             Ok(s) => s,
             Err(_) => return false,
@@ -189,7 +221,7 @@ impl HandshakeData {
 
         let nonce = STANDARD.decode(&self.nonce).unwrap_or_default();
 
-        verify_auth_token(pairing_code, &salt, &nonce, &self.auth_token)
+        verify_auth_token(pairing_code, &salt, &nonce, bound_fingerprint, &self.auth_token)
     }
 }
 
@@ -292,13 +324,15 @@ mod tests {
         assert_ne!(secret1, secret2); // Different codes = different secrets
     }
 
+    const TEST_FP: &str = "sha-256 AA:BB:CC:DD:EE:FF:00:11";
+
     #[test]
     fn test_auth_token_generation() {
         let code = generate_pairing_code();
         let salt = generate_salt();
         let nonce = generate_nonce();
 
-        let token = generate_auth_token(&code, &salt, &nonce);
+        let token = generate_auth_token(&code, &salt, &nonce, TEST_FP);
         assert!(!token.is_empty());
     }
 
@@ -308,8 +342,8 @@ mod tests {
         let salt = generate_salt();
         let nonce = generate_nonce();
 
-        let token = generate_auth_token(&code, &salt, &nonce);
-        assert!(verify_auth_token(&code, &salt, &nonce, &token));
+        let token = generate_auth_token(&code, &salt, &nonce, TEST_FP);
+        assert!(verify_auth_token(&code, &salt, &nonce, TEST_FP, &token));
     }
 
     #[test]
@@ -318,39 +352,62 @@ mod tests {
         let salt = generate_salt();
         let nonce = generate_nonce();
 
-        let token = generate_auth_token(&code, &salt, &nonce);
-        assert!(!verify_auth_token("000000", &salt, &nonce, &token));
+        let token = generate_auth_token(&code, &salt, &nonce, TEST_FP);
+        assert!(!verify_auth_token("000000", &salt, &nonce, TEST_FP, &token));
+    }
+
+    #[test]
+    fn test_auth_token_verification_wrong_fingerprint() {
+        let code = generate_pairing_code();
+        let salt = generate_salt();
+        let nonce = generate_nonce();
+
+        // A token minted for one fingerprint must not validate against another —
+        // this is what stops a relay swapping the DTLS fingerprint.
+        let token = generate_auth_token(&code, &salt, &nonce, TEST_FP);
+        assert!(!verify_auth_token(&code, &salt, &nonce, "sha-256 99:88:77", &token));
     }
 
     #[test]
     fn test_handshake_data_new() {
         let code = generate_pairing_code();
-        let handshake = HandshakeData::new(&code);
+        let handshake = HandshakeData::new(&code, TEST_FP);
 
         assert!(!handshake.salt.is_empty());
         assert!(!handshake.nonce.is_empty());
         assert!(!handshake.auth_token.is_empty());
+        assert_eq!(handshake.dtls_fingerprint.as_deref(), Some(TEST_FP));
     }
 
     #[test]
     fn test_handshake_data_verify_success() {
         let code = generate_pairing_code();
-        let handshake = HandshakeData::new(&code);
+        let handshake = HandshakeData::new(&code, TEST_FP);
 
-        assert!(handshake.verify(&code));
+        assert!(handshake.verify(&code, TEST_FP));
     }
 
     #[test]
     fn test_handshake_data_verify_failure() {
-        let handshake = HandshakeData::new("123456");
+        let handshake = HandshakeData::new("123456", TEST_FP);
 
-        assert!(!handshake.verify("000000"));
+        assert!(!handshake.verify("000000", TEST_FP));
+    }
+
+    #[test]
+    fn test_handshake_verify_fingerprint_mismatch() {
+        // Correct code, but the SDP's fingerprint differs from the signed one:
+        // a swapped fingerprint must be rejected.
+        let code = generate_pairing_code();
+        let handshake = HandshakeData::new(&code, TEST_FP);
+
+        assert!(!handshake.verify(&code, "sha-256 DE:AD:BE:EF"));
     }
 
     #[test]
     fn test_handshake_data_serialization() {
         let code = generate_pairing_code();
-        let handshake = HandshakeData::new(&code);
+        let handshake = HandshakeData::new(&code, TEST_FP);
 
         let json = serde_json::to_string(&handshake).unwrap();
         let restored: HandshakeData = serde_json::from_str(&json).unwrap();
@@ -358,6 +415,7 @@ mod tests {
         assert_eq!(handshake.salt, restored.salt);
         assert_eq!(handshake.nonce, restored.nonce);
         assert_eq!(handshake.auth_token, restored.auth_token);
+        assert_eq!(handshake.dtls_fingerprint, restored.dtls_fingerprint);
     }
 
     #[test]

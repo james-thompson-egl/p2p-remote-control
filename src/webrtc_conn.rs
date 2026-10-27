@@ -105,16 +105,6 @@ pub async fn run_host(
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting host WebRTC server");
 
-    // Generate handshake data based on auth type
-    let handshake = match &auth_type {
-        AuthType::Pairing(code) => HandshakeData::new(code),
-        AuthType::Cert => {
-            // For certificate auth, use a placeholder handshake
-            // The actual cert validation happens separately
-            HandshakeData::new("cert-auth-placeholder")
-        }
-    };
-
     match &auth_type {
         AuthType::Pairing(code) => {
             println!("\n=== HOST MODE ACTIVE ===");
@@ -207,6 +197,16 @@ pub async fn run_host(
         .await
         .ok_or("failed to get local description after ICE gathering")?;
 
+    // Bind the handshake to THIS host's DTLS fingerprint, so a relay or any
+    // man-in-the-middle cannot substitute a different fingerprint undetected.
+    let host_fingerprint = extract_fingerprint_from_sdp(&local_desc.sdp)
+        .ok_or("no DTLS fingerprint in local offer")?;
+
+    let handshake = match &auth_type {
+        AuthType::Pairing(code) => HandshakeData::new(code, &host_fingerprint),
+        AuthType::Cert => HandshakeData::new("cert-auth-placeholder", &host_fingerprint),
+    };
+
     // Embed handshake in SDP
     let handshake_json = serde_json::to_string(&handshake)?;
     let handshake_b64 = base64::encode(&handshake_json);
@@ -232,7 +232,7 @@ pub async fn run_host(
     // Verify handshake before connecting
     match &auth_type {
         AuthType::Pairing(code) => {
-            if !handshake.verify(code) {
+            if !handshake.verify(code, &host_fingerprint) {
                 error!("Handshake verification failed");
                 return Err("Authentication failed".into());
             }
@@ -291,6 +291,11 @@ pub async fn run_client(
     // Parse SDP offer and extract handshake data
     let handshake = extract_handshake_from_sdp(sdp_offer)?;
 
+    // The fingerprint actually present in the offer we received. The handshake
+    // must commit to exactly this value, or it was tampered with in transit.
+    let offer_fingerprint = extract_fingerprint_from_sdp(sdp_offer)
+        .ok_or("no DTLS fingerprint in offer")?;
+
     // Verify based on auth type
     match &auth_type {
         AuthType::Pairing(code) => {
@@ -298,7 +303,7 @@ pub async fn run_client(
                 error!("Invalid pairing code");
                 return Err("Invalid pairing code format".into());
             }
-            if !handshake.verify(code) {
+            if !handshake.verify(code, &offer_fingerprint) {
                 error!("Pairing code verification failed");
                 return Err("Authentication failed".into());
             }
@@ -468,6 +473,16 @@ fn extract_handshake_from_sdp(sdp: &str) -> Result<HandshakeData, Box<dyn std::e
     let handshake: HandshakeData = serde_json::from_slice(&handshake_json)?;
 
     Ok(handshake)
+}
+
+/// Extract the DTLS fingerprint value (e.g. `sha-256 AA:BB:..`) from an SDP.
+/// Both peers parse it identically, so the returned string can be compared
+/// directly against the fingerprint committed to in the handshake.
+fn extract_fingerprint_from_sdp(sdp: &str) -> Option<String> {
+    sdp.lines()
+        .map(|line| line.trim())
+        .find(|line| line.starts_with("a=fingerprint:"))
+        .map(|line| line.trim_start_matches("a=fingerprint:").trim().to_string())
 }
 
 /// Screen capture and data channel loop
