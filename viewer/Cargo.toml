@@ -1,0 +1,40 @@
+[package]
+name = "p2p-remote-viewer"
+version = "0.1.0"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
+
+[dependencies]
+tauri = { version = "2.0", features = [] }
+tauri-plugin-shell = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# WebRTC for P2P connection
+webrtc = "0.13"
+
+# Async
+tokio = { version = "1.42", features = ["full"] }
+
+# Image processing
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+
+# Base64 encoding
+base64 = "0.22"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Windows APIs for input
+windows = { version = "0.58", features = [
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Foundation",
+]}
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

@@ -1,0 +1,61 @@
+[package]
+name = "p2p-remote-control"
+version = "0.1.0"
+edition = "2021"
+description = "Secure, serverless, P2P remote desktop control"
+
+[dependencies]
+# WebRTC P2P
+webrtc = "0.13"
+
+# Bytes for data channel
+bytes = "1.9"
+
+# Async runtime
+tokio = { version = "1.42", features = ["full"] }
+
+# Windows APIs
+windows = { version = "0.58", features = [
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D11",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+]}
+
+# Screen capture (DXGI) - using windows crate instead
+
+# Crypto for pairing code
+argon2 = "0.5"
+base64 = "0.22"
+hmac = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Image processing
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+
+# QR code for pairing
+qrcode = "0.14"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+
+[features]
+default = []
+dxgi = []

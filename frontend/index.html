@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>P2P Remote Control</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        header {
+            background: #16213e;
+            padding: 1rem 2rem;
+            border-bottom: 1px solid #0f3460;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        h1 {
+            font-size: 1.25rem;
+            color: #e94560;
+        }
+
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .status-indicator {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #666;
+        }
+
+        .status-indicator.connected {
+            background: #0f0;
+            box-shadow: 0 0 10px #0f0;
+        }
+
+        .status-indicator.connecting {
+            background: #ff0;
+            animation: pulse 1s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        main {
+            flex: 1;
+            padding: 2rem;
+            display: flex;
+            gap: 2rem;
+        }
+
+        .panel {
+            background: #16213e;
+            border-radius: 8px;
+            padding: 1.5rem;
+            flex: 1;
+        }
+
+        .panel h2 {
+            font-size: 1rem;
+            margin-bottom: 1rem;
+            color: #0f3460;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .mode-selector {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .mode-btn {
+            flex: 1;
+            padding: 1rem;
+            border: 2px solid #0f3460;
+            background: transparent;
+            color: #eee;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 1rem;
+            transition: all 0.2s;
+        }
+
+        .mode-btn:hover {
+            border-color: #e94560;
+        }
+
+        .mode-btn.active {
+            background: #e94560;
+            border-color: #e94560;
+        }
+
+        .input-group {
+            margin-bottom: 1rem;
+        }
+
+        .input-group label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-size: 0.875rem;
+            color: #aaa;
+        }
+
+        .input-group input,
+        .input-group textarea {
+            width: 100%;
+            padding: 0.75rem;
+            border: 1px solid #0f3460;
+            border-radius: 6px;
+            background: #1a1a2e;
+            color: #eee;
+            font-family: monospace;
+            font-size: 0.875rem;
+        }
+
+        .input-group input:focus,
+        .input-group textarea:focus {
+            outline: none;
+            border-color: #e94560;
+        }
+
+        .input-group textarea {
+            min-height: 150px;
+            resize: vertical;
+        }
+
+        .btn {
+            padding: 0.75rem 1.5rem;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 1rem;
+            transition: all 0.2s;
+        }
+
+        .btn-primary {
+            background: #e94560;
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: #d63850;
+        }
+
+        .btn-secondary {
+            background: #0f3460;
+            color: #eee;
+        }
+
+        .btn-secondary:hover {
+            background: #1a4a7a;
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .pairing-code {
+            font-size: 2rem;
+            font-weight: bold;
+            text-align: center;
+            padding: 1rem;
+            background: #0f3460;
+            border-radius: 8px;
+            letter-spacing: 0.5rem;
+            margin: 1rem 0;
+        }
+
+        .remote-display {
+            background: #000;
+            border-radius: 8px;
+            min-height: 400px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .remote-display canvas {
+            max-width: 100%;
+            max-height: 100%;
+        }
+
+        .placeholder {
+            color: #666;
+            text-align: center;
+        }
+
+        .placeholder-icon {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+        }
+
+        .controls {
+            display: flex;
+            gap: 1rem;
+            margin-top: 1rem;
+        }
+
+        .log {
+            background: #000;
+            border-radius: 6px;
+            padding: 1rem;
+            font-family: monospace;
+            font-size: 0.75rem;
+            max-height: 150px;
+            overflow-y: auto;
+            margin-top: 1rem;
+        }
+
+        .log-entry {
+            margin-bottom: 0.25rem;
+        }
+
+        .log-entry.info { color: #0af; }
+        .log-entry.warn { color: #fa0; }
+        .log-entry.error { color: #f00; }
+
+        .hidden {
+            display: none !important;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>P2P Remote Control</h1>
+        <div class="status">
+            <div class="status-indicator" id="statusIndicator"></div>
+            <span id="statusText">Disconnected</span>
+        </div>
+    </header>
+
+    <main>
+        <div class="panel">
+            <h2>Connection</h2>
+
+            <div class="mode-selector">
+                <button class="mode-btn active" data-mode="host">Host</button>
+                <button class="mode-btn" data-mode="client">Client</button>
+            </div>
+
+            <!-- Host Mode -->
+            <div id="hostMode">
+                <div class="input-group">
+                    <label>Pairing Code</label>
+                    <input type="text" id="hostPairingCode" placeholder="Enter 6-digit code" maxlength="6">
+                </div>
+                <button class="btn btn-primary" id="startHostBtn">Start Host</button>
+
+                <div id="hostOfferSection" class="hidden">
+                    <div class="input-group">
+                        <label>SDP Offer (copy this)</label>
+                        <textarea id="hostOffer" readonly></textarea>
+                    </div>
+                    <div class="input-group">
+                        <label>SDP Answer (paste from client)</label>
+                        <textarea id="hostAnswer" placeholder="Paste SDP answer here"></textarea>
+                    </div>
+                    <button class="btn btn-primary" id="connectHostBtn">Connect</button>
+                </div>
+            </div>
+
+            <!-- Client Mode -->
+            <div id="clientMode" class="hidden">
+                <div class="input-group">
+                    <label>Pairing Code</label>
+                    <input type="text" id="clientPairingCode" placeholder="Enter 6-digit code" maxlength="6">
+                </div>
+                <div class="input-group">
+                    <label>SDP Offer (paste from host)</label>
+                    <textarea id="clientOffer" placeholder="Paste SDP offer here"></textarea>
+                </div>
+                <button class="btn btn-primary" id="startClientBtn">Generate Answer</button>
+
+                <div id="clientAnswerSection" class="hidden">
+                    <div class="input-group">
+                        <label>SDP Answer (copy this)</label>
+                        <textarea id="clientAnswer" readonly></textarea>
+                    </div>
+                </div>
+            </div>
+
+            <div class="log" id="log"></div>
+        </div>
+
+        <div class="panel">
+            <h2>Remote Display</h2>
+            <div class="remote-display" id="remoteDisplay">
+                <div class="placeholder" id="placeholder">
+                    <div class="placeholder-icon">🖥️</div>
+                    <p>Connect to start remote control</p>
+                </div>
+                <canvas id="remoteCanvas" class="hidden"></canvas>
+            </div>
+            <div class="controls">
+                <button class="btn btn-secondary" id="fullscreenBtn">Fullscreen</button>
+                <button class="btn btn-secondary" id="disconnectBtn" disabled>Disconnect</button>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        // State
+        let mode = 'host';
+        let peerConnection = null;
+        let dataChannel = null;
+        let isConnected = false;
+
+        // DOM elements
+        const statusIndicator = document.getElementById('statusIndicator');
+        const statusText = document.getElementById('statusText');
+        const log = document.getElementById('log');
+        const modeBtns = document.querySelectorAll('.mode-btn');
+        const hostMode = document.getElementById('hostMode');
+        const clientMode = document.getElementById('clientMode');
+
+        // Logging
+        function logEntry(message, type = 'info') {
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${type}`;
+            const time = new Date().toLocaleTimeString();
+            entry.textContent = `[${time}] ${message}`;
+            log.appendChild(entry);
+            log.scrollTop = log.scrollHeight;
+        }
+
+        // Status update
+        function setStatus(status, connected = false) {
+            statusText.textContent = status;
+            statusIndicator.className = 'status-indicator' + (connected ? ' connected' : '');
+        }
+
+        // Mode selection
+        modeBtns.forEach(btn => {
+            btn.addEventListener('click', () => {
+                modeBtns.forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                mode = btn.dataset.mode;
+                hostMode.classList.toggle('hidden', mode !== 'host');
+                clientMode.classList.toggle('hidden', mode !== 'client');
+                logEntry(`Switched to ${mode} mode`);
+            });
+        });
+
+        // Host flow
+        document.getElementById('startHostBtn').addEventListener('click', async () => {
+            const code = document.getElementById('hostPairingCode').value;
+            if (!code || code.length !== 6) {
+                logEntry('Please enter a valid 6-digit pairing code', 'error');
+                return;
+            }
+
+            setStatus('Generating offer...', false);
+
+            try {
+                const response = await window.__TAURI__.invoke('start_host', { pairingCode: code });
+                document.getElementById('hostOffer').value = response;
+                document.getElementById('hostOfferSection').classList.remove('hidden');
+                logEntry('SDP offer generated');
+            } catch (e) {
+                logEntry(`Error: ${e}`, 'error');
+                setStatus('Error', false);
+            }
+        });
+
+        document.getElementById('connectHostBtn').addEventListener('click', async () => {
+            const answer = document.getElementById('hostAnswer').value;
+            if (!answer) {
+                logEntry('Please paste the SDP answer', 'error');
+                return;
+            }
+
+            setStatus('Connecting...', true);
+
+            // In full implementation, set remote description and wait for connection
+            setTimeout(() => {
+                setStatus('Connected', true);
+                isConnected = true;
+                document.getElementById('placeholder').classList.add('hidden');
+                document.getElementById('remoteCanvas').classList.remove('hidden');
+                document.getElementById('disconnectBtn').disabled = false;
+                logEntry('Connected to remote host');
+            }, 1000);
+        });
+
+        // Client flow
+        document.getElementById('startClientBtn').addEventListener('click', async () => {
+            const code = document.getElementById('clientPairingCode').value;
+            const offer = document.getElementById('clientOffer').value;
+
+            if (!code || code.length !== 6) {
+                logEntry('Please enter a valid 6-digit pairing code', 'error');
+                return;
+            }
+            if (!offer) {
+                logEntry('Please paste the SDP offer from host', 'error');
+                return;
+            }
+
+            setStatus('Generating answer...', false);
+
+            try {
+                const response = await window.__TAURI__.invoke('start_client', {
+                    pairingCode: code,
+                    sdpOffer: offer
+                });
+                document.getElementById('clientAnswer').value = response;
+                document.getElementById('clientAnswerSection').classList.remove('hidden');
+                logEntry('SDP answer generated');
+            } catch (e) {
+                logEntry(`Error: ${e}`, 'error');
+                setStatus('Error', false);
+            }
+        });
+
+        // Fullscreen
+        document.getElementById('fullscreenBtn').addEventListener('click', () => {
+            window.__TAURI__.invoke('set_fullscreen', { enabled: true });
+        });
+
+        // Disconnect
+        document.getElementById('disconnectBtn').addEventListener('click', () => {
+            if (peerConnection) {
+                peerConnection.close();
+            }
+            setStatus('Disconnected', false);
+            isConnected = false;
+            document.getElementById('placeholder').classList.remove('hidden');
+            document.getElementById('remoteCanvas').classList.add('hidden');
+            document.getElementById('disconnectBtn').disabled = true;
+            logEntry('Disconnected');
+        });
+
+        // Canvas input handling
+        const canvas = document.getElementById('remoteCanvas');
+        const ctx = canvas.getContext('2d');
+
+        canvas.addEventListener('mousemove', (e) => {
+            if (!isConnected) return;
+            const rect = canvas.getBoundingClientRect();
+            const x = Math.floor((e.clientX - rect.left) / rect.width * canvas.width);
+            const y = Math.floor((e.clientY - rect.top) / rect.height * canvas.height);
+            sendInput('mousemove', x, y);
+        });
+
+        canvas.addEventListener('mousedown', (e) => {
+            if (!isConnected) return;
+            sendInput('mousedown', null, null, e.button);
+        });
+
+        canvas.addEventListener('mouseup', (e) => {
+            if (!isConnected) return;
+            sendInput('mouseup', null, null, e.button);
+        });
+
+        canvas.addEventListener('wheel', (e) => {
+            if (!isConnected) return;
+            e.preventDefault();
+            const delta = e.deltaY > 0 ? -120 : 120;
+            sendInput('wheel', null, null, null, delta);
+        });
+
+        function sendInput(type, x, y, button, delta) {
+            const input = { type, x, y, button, delta };
+            if (dataChannel && dataChannel.readyState === 'open') {
+                dataChannel.send(JSON.stringify(input));
+            }
+        }
+
+        logEntry('P2P Remote Viewer ready');
+    </script>
+</body>
+</html>
