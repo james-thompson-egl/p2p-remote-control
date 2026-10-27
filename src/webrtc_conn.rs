@@ -164,15 +164,24 @@ pub async fn run_host(
         })
     }));
 
-    // Generate SDP offer
+    // Generate SDP offer, then wait for ICE gathering to complete so the
+    // candidate lines are embedded in the SDP we print (manual signaling has
+    // no trickle channel, so candidates must be in the copied SDP).
     let offer = pc.create_offer(None).await?;
-    pc.set_local_description(offer.clone()).await?;
+    let mut gather_complete = pc.gathering_complete_promise().await;
+    pc.set_local_description(offer).await?;
+    let _ = gather_complete.recv().await;
+
+    let local_desc = pc
+        .local_description()
+        .await
+        .ok_or("failed to get local description after ICE gathering")?;
 
     // Embed handshake in SDP
     let handshake_json = serde_json::to_string(&handshake)?;
     let handshake_b64 = base64::encode(&handshake_json);
 
-    let mut sdp_offer = offer.sdp.clone();
+    let mut sdp_offer = local_desc.sdp.clone();
     sdp_offer.push_str(&format!("a=handshake:{}\r\n", handshake_b64));
 
     println!("=== SDP OFFER (copy this) ===");
@@ -292,13 +301,21 @@ pub async fn run_client(
     let offer = webrtc::peer_connection::sdp::session_description::RTCSessionDescription::offer(sdp_offer.to_string())?;
     pc.set_remote_description(offer).await?;
 
-    // Create answer
+    // Create answer, then wait for ICE gathering to complete so the candidate
+    // lines are embedded in the SDP we print (see offer side above).
     let answer = pc.create_answer(None).await?;
-    pc.set_local_description(answer.clone()).await?;
+    let mut gather_complete = pc.gathering_complete_promise().await;
+    pc.set_local_description(answer).await?;
+    let _ = gather_complete.recv().await;
+
+    let local_desc = pc
+        .local_description()
+        .await
+        .ok_or("failed to get local description after ICE gathering")?;
 
     // Display SDP answer
     println!("\n=== SDP ANSWER (copy this) ===");
-    println!("{}", answer.sdp);
+    println!("{}", local_desc.sdp);
     println!("==============================\n");
 
     println!("Copy the SDP answer above and paste it into the host machine.\n");
