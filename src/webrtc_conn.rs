@@ -14,6 +14,7 @@ use std::time::Duration;
 use super::screen_capture::ScreenCapturer;
 use super::input_injector::{InputInjector, InputEvent};
 use super::pairing::{HandshakeData, validate_pairing_code};
+use super::cert;
 
 // WebRTC imports from webrtc-rs
 use webrtc::api::{APIBuilder, media_engine::MediaEngine};
@@ -31,6 +32,13 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use std::time::Instant;
 use bytes::Bytes;
+
+/// Authentication type
+#[derive(PartialEq)]
+pub enum AuthType {
+    Pairing(String),  // Traditional 6-digit pairing code
+    Cert,             // Certificate-based authentication
+}
 
 /// Input message format for data channel
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,24 +99,46 @@ async fn create_peer_connection() -> Result<webrtc::peer_connection::RTCPeerConn
 }
 
 pub async fn run_host(
-    pairing_code: String,
+    auth_type: AuthType,
     mut screen_capturer: ScreenCapturer,
     input_injector: InputInjector,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting host WebRTC server");
 
-    // Generate handshake data
-    let handshake = HandshakeData::new(&pairing_code);
+    // Generate handshake data based on auth type
+    let handshake = match &auth_type {
+        AuthType::Pairing(code) => HandshakeData::new(code),
+        AuthType::Cert => {
+            // For certificate auth, use a placeholder handshake
+            // The actual cert validation happens separately
+            HandshakeData::new("cert-auth-placeholder")
+        }
+    };
 
-    println!("\n=== HOST MODE ACTIVE ===");
-    println!("Pairing Code: {}", pairing_code);
-    println!("\nTo connect:");
-    println!("1. On viewer machine, run: p2p-remote --connect {}", pairing_code);
-    println!("2. Copy the SDP offer shown below");
-    println!("3. Paste it into the viewer");
-    println!("4. Copy the SDP answer from viewer");
-    println!("5. Paste it here to establish connection");
-    println!("\n=========================\n");
+    match &auth_type {
+        AuthType::Pairing(code) => {
+            println!("\n=== HOST MODE ACTIVE ===");
+            println!("Pairing Code: {}", code);
+            println!("\nTo connect:");
+            println!("1. On viewer machine, run: p2p-remote --connect {}", code);
+            println!("2. Copy the SDP offer shown below");
+            println!("3. Paste it into the viewer");
+            println!("4. Copy the SDP answer from viewer");
+            println!("5. Paste it here to establish connection");
+            println!("\n=========================\n");
+        }
+        AuthType::Cert => {
+            println!("\n=== HOST MODE ACTIVE (CERTIFICATE AUTH) ===");
+            println!("Waiting for certificate-based connection...");
+            println!("\nTo connect:");
+            println!("1. On viewer machine, run: p2p-remote --connect cert --auth cert");
+            println!("2. Copy the SDP offer shown below");
+            println!("3. Paste it into the viewer");
+            println!("4. Copy the SDP answer from viewer");
+            println!("5. Paste it here to establish connection");
+            println!("\n==========================================\n");
+        }
+    }
 
     // Create peer connection
     let pc = create_peer_connection().await?;
@@ -200,9 +230,23 @@ pub async fn run_host(
     debug!("Received SDP answer, attempting to connect...");
 
     // Verify handshake before connecting
-    if !handshake.verify(&pairing_code) {
-        error!("Handshake verification failed");
-        return Err("Authentication failed".into());
+    match &auth_type {
+        AuthType::Pairing(code) => {
+            if !handshake.verify(code) {
+                error!("Handshake verification failed");
+                return Err("Authentication failed".into());
+            }
+        }
+        AuthType::Cert => {
+            // For certificate auth, verify client certificate
+            info!("Verifying client certificate...");
+            let (client_cert, _) = cert::load_client_cert()?;
+            if !cert::verify_cert_not_expired(&client_cert)? {
+                error!("Client certificate has expired");
+                return Err("Certificate expired".into());
+            }
+            info!("Client certificate verified");
+        }
     }
 
     // Set remote description
@@ -239,26 +283,38 @@ pub async fn run_host(
 }
 
 pub async fn run_client(
-    pairing_code: &str,
+    auth_type: AuthType,
     sdp_offer: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting client WebRTC connection");
 
-    if !validate_pairing_code(pairing_code) {
-        error!("Invalid pairing code");
-        return Err("Invalid pairing code format".into());
-    }
-
     // Parse SDP offer and extract handshake data
     let handshake = extract_handshake_from_sdp(sdp_offer)?;
 
-    // Verify pairing code
-    if !handshake.verify(pairing_code) {
-        error!("Pairing code verification failed");
-        return Err("Authentication failed".into());
+    // Verify based on auth type
+    match &auth_type {
+        AuthType::Pairing(code) => {
+            if !validate_pairing_code(code) {
+                error!("Invalid pairing code");
+                return Err("Invalid pairing code format".into());
+            }
+            if !handshake.verify(code) {
+                error!("Pairing code verification failed");
+                return Err("Authentication failed".into());
+            }
+            debug!("Pairing code verified");
+        }
+        AuthType::Cert => {
+            info!("Certificate authentication mode");
+            // Verify client certificate exists and is valid
+            let (client_cert, _) = cert::load_client_cert()?;
+            if !cert::verify_cert_not_expired(&client_cert)? {
+                error!("Client certificate has expired");
+                return Err("Certificate expired".into());
+            }
+            debug!("Client certificate verified");
+        }
     }
-
-    debug!("Pairing code verified");
 
     // Create peer connection
     let pc = create_peer_connection().await?;

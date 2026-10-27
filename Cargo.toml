@@ -37,6 +37,12 @@ hmac = "0.12"
 sha2 = "0.10"
 rand = "0.8"
 
+# Certificate generation and validation
+rcgen = "0.13"
+x509-parser = "0.16"
+time = { version = "0.3", features = ["macros"] }
+pem = "3.0"
+
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
