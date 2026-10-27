@@ -8,6 +8,10 @@ description = "Secure, serverless, P2P remote desktop control"
 # WebRTC P2P
 webrtc = "0.13"
 
+# HTTP client for the optional signalling relay (rustls to match the webrtc stack,
+# no system OpenSSL needed)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
 # Bytes for data channel
 bytes = "1.9"
 

@@ -12,6 +12,7 @@ mod dxgi_capture;
 mod input_injector;
 pub mod pairing;
 pub mod cert;
+pub mod signaling;
 mod webrtc_conn;
 mod video_encoder;
 mod client_input;
@@ -40,27 +41,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Parse common options
     let auth_type = parse_auth_type(&args);
+    let relay_url = parse_relay(&args);
 
     match args[1].as_str() {
         "--host" => {
             // Host mode: wait for connections
-            host_mode(auth_type).await?;
+            host_mode(auth_type, relay_url).await?;
         }
         "--connect" => {
-            // Client mode: connect to a host
-            let auth_value = if args.len() > 2 { &args[2] } else { "" };
-
-            // Check if auth_value is a pairing code or "cert"
-            let auth = if auth_value == "cert" || auth_type == webrtc_conn::AuthType::Cert {
-                webrtc_conn::AuthType::Cert
-            } else if validate_auth_arg(auth_value) {
-                webrtc_conn::AuthType::Pairing(auth_value.to_string())
+            if let Some(url) = relay_url {
+                // Relay mode: the host's one-time token is both the rendezvous key
+                // and the pairing secret. Take it from --token, or prompt for it.
+                let token = match parse_token(&args) {
+                    Some(t) => t,
+                    None => prompt_line("Enter the connection token from the host: ")?,
+                };
+                if token.is_empty() {
+                    eprintln!("A connection token is required in relay mode.");
+                    return Ok(());
+                }
+                client_mode_relay(url, token).await?;
             } else {
-                eprintln!("Usage: {} --connect <pairing-code> | cert", args[0]);
-                return Ok(());
-            };
+                // Client mode: connect to a host via manual SDP copy-paste
+                let auth_value = if args.len() > 2 { &args[2] } else { "" };
 
-            client_mode(auth).await?;
+                // Check if auth_value is a pairing code or "cert"
+                let auth = if auth_value == "cert" || auth_type == webrtc_conn::AuthType::Cert {
+                    webrtc_conn::AuthType::Cert
+                } else if validate_auth_arg(auth_value) {
+                    webrtc_conn::AuthType::Pairing(auth_value.to_string())
+                } else {
+                    eprintln!("Usage: {} --connect <pairing-code> | cert [--relay <url>]", args[0]);
+                    return Ok(());
+                };
+
+                client_mode(auth).await?;
+            }
         }
         "--gen-cert" => {
             // Generate certificate for authentication
@@ -112,6 +128,12 @@ Usage:
   {} --list-certs        List available certificates
   {} --show-cert         Show current certificate info
 
+Signalling relay (optional — removes manual SDP copy-paste):
+  --relay <url>          Exchange SDP via a relay instead of copy-paste.
+                         Host prints a one-time token; run the viewer with
+                         --relay <url> and enter (or pass --token) that token.
+  --token <token>        Viewer: the host's one-time token (else prompted)
+
 Authentication:
   --auth <type>          Auth type: "pairing" (default) or "cert"
   --validity <days>      Certificate validity in days (for --gen-cert)
@@ -161,7 +183,10 @@ fn validate_auth_arg(arg: &str) -> bool {
     pairing::validate_pairing_code(arg) || arg == "cert"
 }
 
-async fn host_mode(auth_type: webrtc_conn::AuthType) -> Result<(), Box<dyn std::error::Error>> {
+async fn host_mode(
+    auth_type: webrtc_conn::AuthType,
+    relay_url: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     info!("Running in HOST mode - waiting for connection");
 
     // Initialize screen capture
@@ -172,10 +197,46 @@ async fn host_mode(auth_type: webrtc_conn::AuthType) -> Result<(), Box<dyn std::
     let input_injector = input_injector::InputInjector::new();
     info!("Input injector ready");
 
+    // In relay mode the host mints a one-time token; it doubles as the pairing
+    // secret, so the auth type is overridden to use it.
+    let relay = relay_url.map(|url| signaling::Relay::new(&url, signaling::generate_token()));
+    let auth_type = match &relay {
+        Some(r) => webrtc_conn::AuthType::Pairing(r.token.clone()),
+        None => auth_type,
+    };
+
     // Start WebRTC host
-    webrtc_conn::run_host(auth_type, screen_capturer, input_injector).await?;
+    webrtc_conn::run_host(auth_type, screen_capturer, input_injector, relay).await?;
 
     Ok(())
+}
+
+/// Viewer side of relay mode: fetch the host's offer from the relay, answer it.
+async fn client_mode_relay(url: String, token: String) -> Result<(), Box<dyn std::error::Error>> {
+    info!("Connecting via relay...");
+    let relay = signaling::Relay::new(&url, token);
+    let offer = relay.poll_offer(std::time::Duration::from_secs(120)).await?;
+    info!("Received offer via relay, generating answer...");
+    let auth = webrtc_conn::AuthType::Pairing(relay.token.clone());
+    webrtc_conn::run_client(auth, &offer, Some(relay)).await?;
+    Ok(())
+}
+
+fn parse_relay(args: &[String]) -> Option<String> {
+    args.iter().position(|a| a == "--relay").and_then(|i| args.get(i + 1)).map(|s| s.to_string())
+}
+
+fn parse_token(args: &[String]) -> Option<String> {
+    args.iter().position(|a| a == "--token").and_then(|i| args.get(i + 1)).map(|s| s.to_string())
+}
+
+fn prompt_line(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+    use std::io::Write;
+    print!("{}", prompt);
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(line.trim().to_string())
 }
 
 async fn client_mode(auth: webrtc_conn::AuthType) -> Result<(), Box<dyn std::error::Error>> {
@@ -216,8 +277,8 @@ async fn client_mode(auth: webrtc_conn::AuthType) -> Result<(), Box<dyn std::err
 
     info!("SDP offer received, generating answer...");
 
-    // Initialize WebRTC client
-    webrtc_conn::run_client(auth, &sdp_offer).await?;
+    // Initialize WebRTC client (manual copy-paste mode: no relay)
+    webrtc_conn::run_client(auth, &sdp_offer, None).await?;
 
     Ok(())
 }

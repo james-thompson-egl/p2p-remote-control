@@ -102,31 +102,42 @@ pub async fn run_host(
     auth_type: AuthType,
     mut screen_capturer: ScreenCapturer,
     input_injector: InputInjector,
+    relay: Option<crate::signaling::Relay>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting host WebRTC server");
 
-    match &auth_type {
-        AuthType::Pairing(code) => {
-            println!("\n=== HOST MODE ACTIVE ===");
-            println!("Pairing Code: {}", code);
-            println!("\nTo connect:");
-            println!("1. On viewer machine, run: p2p-remote --connect {}", code);
-            println!("2. Copy the SDP offer shown below");
-            println!("3. Paste it into the viewer");
-            println!("4. Copy the SDP answer from viewer");
-            println!("5. Paste it here to establish connection");
-            println!("\n=========================\n");
-        }
-        AuthType::Cert => {
-            println!("\n=== HOST MODE ACTIVE (CERTIFICATE AUTH) ===");
-            println!("Waiting for certificate-based connection...");
-            println!("\nTo connect:");
-            println!("1. On viewer machine, run: p2p-remote --connect cert --auth cert");
-            println!("2. Copy the SDP offer shown below");
-            println!("3. Paste it into the viewer");
-            println!("4. Copy the SDP answer from viewer");
-            println!("5. Paste it here to establish connection");
-            println!("\n==========================================\n");
+    if let Some(relay) = &relay {
+        println!("\n=== HOST MODE ACTIVE (RELAY) ===");
+        println!("Connection token: {}", relay.token);
+        println!("\nOn the viewer machine, run:");
+        println!("  p2p-remote --connect --relay <relay-url> --token {}", relay.token);
+        println!("\nThe token is the only secret the viewer needs; it is good for this");
+        println!("session only. The offer and answer are exchanged through the relay.");
+        println!("\n================================\n");
+    } else {
+        match &auth_type {
+            AuthType::Pairing(code) => {
+                println!("\n=== HOST MODE ACTIVE ===");
+                println!("Pairing Code: {}", code);
+                println!("\nTo connect:");
+                println!("1. On viewer machine, run: p2p-remote --connect {}", code);
+                println!("2. Copy the SDP offer shown below");
+                println!("3. Paste it into the viewer");
+                println!("4. Copy the SDP answer from viewer");
+                println!("5. Paste it here to establish connection");
+                println!("\n=========================\n");
+            }
+            AuthType::Cert => {
+                println!("\n=== HOST MODE ACTIVE (CERTIFICATE AUTH) ===");
+                println!("Waiting for certificate-based connection...");
+                println!("\nTo connect:");
+                println!("1. On viewer machine, run: p2p-remote --connect cert --auth cert");
+                println!("2. Copy the SDP offer shown below");
+                println!("3. Paste it into the viewer");
+                println!("4. Copy the SDP answer from viewer");
+                println!("5. Paste it here to establish connection");
+                println!("\n==========================================\n");
+            }
         }
     }
 
@@ -214,18 +225,25 @@ pub async fn run_host(
     let mut sdp_offer = local_desc.sdp.clone();
     sdp_offer.push_str(&format!("a=handshake:{}\r\n", handshake_b64));
 
-    println!("=== SDP OFFER (copy this) ===");
-    println!("{}", sdp_offer);
-    println!("============================\n");
+    // Exchange the offer/answer: through the relay if configured, otherwise the
+    // manual copy-paste path.
+    let sdp_answer = if let Some(relay) = &relay {
+        relay.put_offer(&sdp_offer).await?;
+        println!("Offer published to relay. Waiting for the viewer to connect...");
+        relay.poll_answer(std::time::Duration::from_secs(120)).await?
+    } else {
+        println!("=== SDP OFFER (copy this) ===");
+        println!("{}", sdp_offer);
+        println!("============================\n");
 
-    // Wait for SDP answer from user
-    println!("Enter SDP answer from viewer (press Enter twice when done):");
-    let sdp_answer = read_multiline_input()?;
-
-    if sdp_answer.is_empty() {
-        error!("No SDP answer provided");
-        return Err("Connection cancelled".into());
-    }
+        println!("Enter SDP answer from viewer (press Enter twice when done):");
+        let answer = read_multiline_input()?;
+        if answer.is_empty() {
+            error!("No SDP answer provided");
+            return Err("Connection cancelled".into());
+        }
+        answer
+    };
 
     debug!("Received SDP answer, attempting to connect...");
 
@@ -285,6 +303,7 @@ pub async fn run_host(
 pub async fn run_client(
     auth_type: AuthType,
     sdp_offer: &str,
+    relay: Option<crate::signaling::Relay>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting client WebRTC connection");
 
@@ -299,7 +318,9 @@ pub async fn run_client(
     // Verify based on auth type
     match &auth_type {
         AuthType::Pairing(code) => {
-            if !validate_pairing_code(code) {
+            // In relay mode the "code" is the high-entropy rendezvous token, not a
+            // 6-digit pairing code, so the format check only applies to copy-paste.
+            if relay.is_none() && !validate_pairing_code(code) {
                 error!("Invalid pairing code");
                 return Err("Invalid pairing code format".into());
             }
@@ -374,12 +395,17 @@ pub async fn run_client(
         .await
         .ok_or("failed to get local description after ICE gathering")?;
 
-    // Display SDP answer
-    println!("\n=== SDP ANSWER (copy this) ===");
-    println!("{}", local_desc.sdp);
-    println!("==============================\n");
+    // Return the answer: through the relay if configured, otherwise copy-paste.
+    if let Some(relay) = &relay {
+        relay.put_answer(&local_desc.sdp).await?;
+        println!("\nAnswer published to relay. Establishing connection...\n");
+    } else {
+        println!("\n=== SDP ANSWER (copy this) ===");
+        println!("{}", local_desc.sdp);
+        println!("==============================\n");
 
-    println!("Copy the SDP answer above and paste it into the host machine.\n");
+        println!("Copy the SDP answer above and paste it into the host machine.\n");
+    }
 
     // Wait for connection
     let timeout = Duration::from_secs(60);
